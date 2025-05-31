@@ -1,0 +1,178 @@
+addEventListener('fetch', event => event.respondWith(handleRequest(event.request)));
+function replaceHtmlLinks(content) {
+  const languages = ['zh-CN', 'zh-TW', 'ja', 'en'];
+  languages.forEach(lang => {
+    const regex = new RegExp(
+      `href="/${lang}/(scripts|users)/(\\d+)-[^/]+/?(code|versions|feedback|stats|discussions)?/?(\\d+)?/?(comments|subscribe)?/?(\\d+)?/?\\b"`,'g');
+    content = content.replace(regex, (match, p1, p2, p3, p4, p5, p6) => {
+      let newUrl = `href="/${lang}/${p1}/${p2}`;
+      if (p3) newUrl += `/${p3}`; 
+      if (p4) newUrl += `/${p4}`;
+      if (p5) newUrl += `/${p5}`; 
+      if (p6) newUrl += `/${p6}`;
+      newUrl += '"'; 
+      return newUrl;
+   });
+ });return content;
+}
+async function fetchWithRetry(request, retries = 8) {
+  let attempt = 0;
+  while (attempt <= retries) {
+    try {const response = await fetch(request);
+      if (response.status === 503 || response.status === 502 || response.status === 429)
+       {throw new Error(`Retryable status code: ${response.status}`);}
+      return response;
+   } catch (error) {attempt++;
+      if (attempt > retries) {return new Response(`請求錯誤 after ${retries} attempts: ${error.message}`, {status: 520});
+     }
+      const adjustedAttempt = Math.floor(attempt / 2);
+      const delay = Math.min(Math.pow(1.2, adjustedAttempt) * 200, 300);
+      await new Promise(resolve => setTimeout(resolve, delay));
+   }
+ }
+}
+async function handleRequest(request) {
+  const cookieHeader = request.headers.get('cookie');
+  const url = new URL(request.url);
+  const country = request.headers.get('x-country');
+  if (url.pathname === '/') url.pathname = '/en';
+  if (url.pathname.startsWith('/zh-hans')) url.pathname = url.pathname.replace('/zh-hans', '/zh-CN');
+  if (url.pathname.startsWith('/zh-hant')) url.pathname = url.pathname.replace('/zh-hant', '/zh-TW');
+  const targetUrl = new URL('https://greasyfork.org' + url.pathname + url.search);
+  const shouldKeep = url.pathname.includes('/users') || url.pathname.includes('/import') || url.pathname.includes('/discussions') || url.pathname.includes('/reports');
+  const modifiedHeaders = new Headers(request.headers);
+  // if (!shouldKeep) {modifiedHeaders.delete('Cookie');}
+  const headersToRemove = ['origin', 'accept-language', 'referer', 'remote-addr', 'x-forwarded-for', 'x-real-ip', 'x-forwarded-proto', 'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker', 'node', 'x-nf-account-id', 'x-nf-account-tier', 'x-nf-client-connection-ip', 'x-nf-netlify-proxy', 'x-nf-request-id', 'x-nf-site-id', 'netlify-invocation-source'];
+  headersToRemove.forEach(header => modifiedHeaders.delete(header));
+  modifiedHeaders.set('Origin', 'https://greasyfork.org');
+  modifiedHeaders.set('Accept-Language', 'zh-CN');
+  const shouldFollowRedirect = request.method !== 'POST' &&
+    /^\/(zh-CN|zh-TW|zh-hans|zh-hant|ja|en)\/(scripts|users)\//.test(url.pathname) &&
+    !url.pathname.endsWith('.json') &&
+    !url.pathname.endsWith('.js');
+    const newRequest = new Request(targetUrl, {
+  method: request.method,
+  headers: modifiedHeaders,
+  body: (request.method === 'GET' || request.method === 'HEAD') ? null : request.body,
+  redirect: shouldFollowRedirect ? 'follow' : 'manual',
+});
+    const response = await fetchWithRetry(newRequest);
+    if (!shouldFollowRedirect && response.status >= 300 && response.status < 400) {const location = response.headers.get('Location');
+      if (location) {const newLocation = await replaceDomainsInLocation(location);
+        const renewHeaders = new Headers(response.headers);
+        renewHeaders.set('Location', newLocation);
+        return new Response(null, {status: response.status, statusText: response.statusText, headers: renewHeaders});}}
+    if (response.status == 404) {return Response.redirect('https://你的部署链接/404', 302)}
+    let responseBody = await response.text();
+    const modifiedBody = await modifyResponseBody(responseBody, country, request);
+if (!shouldKeep && response.status >= 200 && response.status < 400) {
+    const finalHeaders = shouldKeep ? new Headers(response.headers) : new Headers();
+    finalHeaders.delete('Link');
+    finalHeaders.set('Content-Type', 'text/html; charset=utf-8');
+    // finalHeaders.set('Cache-Control', 'public, max-age=172800, stale-while-revalidate=86400');
+    finalHeaders.set('Vary', 'Accept-Encoding');
+    return new Response(modifiedBody, {
+        status: response.status, 
+        statusText: response.statusText, 
+        headers: finalHeaders
+    });
+} else {
+    const finalHeaders = shouldKeep ? new Headers(response.headers) : new Headers();
+    finalHeaders.delete('Link');
+    finalHeaders.set('Content-Type', 'text/html; charset=utf-8');
+    return new Response(modifiedBody, {
+        status: response.status, 
+        statusText: response.statusText, 
+        headers: finalHeaders
+    });
+ }
+}
+async function replaceDomainsInLocation(location) {
+  const domainMappings = [{from: 'update.greasyfork.org', to: 'update.你的部署链接'}, {from: 'api.greasyfork.org', to: 'api.你的部署链接'}, {from: 'greasyfork.org', to: '你的部署链接'}];
+  let newLocation = location;
+  for (const mapping of domainMappings) {
+    if (newLocation.includes(mapping.from)) {newLocation = newLocation.replace(mapping.from, mapping.to);
+      break;}}return newLocation;
+}
+async function replaceSensitiveWords(content, sensitiveWords = []) {
+  sensitiveWords.forEach(word => {
+    const re = '＃'.repeat(word.length);
+    const regex = new RegExp(word, 'gi');
+    content = content.replace(regex, re);
+ });return content;}
+async function removeUnwantedElements(content) {
+  const raws = [
+    /<img\s+[^>]*src="\/vite\/assets\/blacklogo96-[^"]+\.png"[^>]*>/gi,
+    /<link\s+rel="search"[^>]*>/gi,
+    /<link\s+rel="alternate"[^>]*>/gi,
+    /<link\s+rel="canonical"\s+href="[^"]+"[^>]*>/gi,
+    /<meta\s*name\s*=\s*["'][^"']*clckd["'][^>]*>/i,
+    /<meta\s*name\s*=\s*["'][^"']*lhverifycode["'][^>]*>/i,
+    /<meta\s*name\s*=\s*["'][^"']*robots["'][^>]*>/i,
+    /<link\s+rel="icon"\s+href="\/vite\/assets\/blacklogo16-[^"]+\.png"\s*\/?>/i,
+    /<script\s+src="\/vite\/assets\/application-[^"]+\.js"\s+crossorigin="anonymous"\s+type="module"\s*><\/script>/i,
+    /<!-- Global site tag \(gtag.js\) - Google Analytics -->[\s\S]*?<script\s*async\s*src="https:\/\/www\.googletagmanager\.com\/gtag\/js\?id=[^"]+"><\/script>[\s\S]*?<script>[\s\S]*?<\/script>/i,
+    /<script\s*async\s*src="https:\/\/pagead2\.googlesyndication\.com\/pagead\/js\/adsbygoogle\.js\?client=[^"]+"[\s\S]*?<\/script>/i,
+    /<link rel="stylesheet" href="https:\/\/fonts\.googleapis\.com\/css\?[^"]*Open\+Sans[^"]*display=swap"[^>]*>/i,
+    /<noscript><link rel="stylesheet" href="https:\/\/fonts\.googleapis\.com\/css\?[^"]*Open\+Sans[^"]*display=swap"><\/noscript>/i,
+    /<form\b[^>]*\bclass\s*=\s*["'][^"']*external-login-form[^"']*["'][^>]*>[\s\S]*?<\/form>/gi,
+    /<main\b[^>]*\bid\s*=\s*["'][^"']*installation-instructions-modal-content[^"']*["'][^>]*>[\s\S]*?<\/main>/gi,
+    /<script\s*async\s*src="https:\/\/media\.ethicalads\.io\/media\/client\/ethicalads\.min\.js"[^>]*><\/script>/gi,
+    /<form\b[^>]*\bclass\s*=\s*["'][^"']*language-selector[^"']*["'][^>]*>[\s\S]*?<\/form>/gi,
+    /<div\s+class="modal__container"\s+role="dialog"\s+aria-modal="true">[\s\S]*?<\/div>/gi,
+    /<li\b[^>]*>\s*<a\s+href="\/[^\/]+\/(discussions|users|moderator_actions)"[^>]*>[\s\S]*?<\/a>\s*<\/li>/gi,
+    /<div[^>]*id="script-show-ea-image"[^>]*><\/div>/gi,
+    /<div[^>]*src="[^"]*endowmentoverhangutmost\.com[^"]*"[^>]*><\/div>/gi,
+    /<div\b[^>]*\bclass\s*=\s*["'][^"']*ad-content[^"']*["'][^>]*>[\s\S]*?<\/div>/gi,
+    /<div\b[^>]*\bid\s*=\s*["'][^"']*script-show-info-ad[^"']*["'][^>]*>[\s\S]*?<\/div>/gi,
+    /<div\s+class="modal__overlay"[^>]*>[\s\S]*?<\/div>/gi,
+    /<div\s+class="code-container"[^>]*>[\s\S]*?<\/div>/gi,
+    /<div\s+id="installation-instructions-modal-[^"]*"[^>]*>[\s\S]*?<\/div>/gi,
+    /<div\s+[^>]*class="[^"]*\bad\b[^"]*"[^>]*>[\s\S]*?<\/div>/gi,
+    /<script>\s*\/\*\s*submit is handled by js if enabled\s*\*\/\s*document\.querySelectorAll\("\.language-selector-submit"\)\.forEach\(\(lss\)\s*=>\s*{\s*lss\.style\.display\s*=\s*"none"\s*}\)\s*<\/script>/gi,
+    /<li>\s*<a\s+href="[^"]*\/code">\s*<span>[^<]*<\/span>\s*<\/a>\s*<\/li>/gi,
+    /<section\s+id=["']home-step-[^"']*["'][^>]*>[\s\S]*?<\/section>/gi
+  ];
+  return raws.reduce((content, rawd) => content.replace(rawd, ''), content);
+}
+async function modifyResponseBody(content, country, request) {
+  const url = new URL(request.url);
+  const chkeywords = ['/notifications', '/import', '/discussions'];
+  const coded = atob('');
+  const fixedString = decodeURIComponent(escape(coded)); 
+  const sensitiveWords = JSON.parse(fixedString);
+  const shouldSkipReplacement = chkeywords.some(keyword => url.pathname.includes(keyword));
+  const path = url.pathname;
+  const newPath = path.replace(/^\/[^/]+/, '');
+  if (shouldSkipReplacement) {
+    content = content.replace(/<\/head>/i, `<script src="https://cdn.jsdmirror.cn/gh/emn178/js-sha1@master/build/sha1.min.js" crossorigin="anonymous"></script><script src="https://cdn.jsdmirror.cn/npm/@hotwired/turbo@latest/dist/turbo.es2017-esm.min.js" crossorigin="anonymous" type="module"></script></head>`);}  
+  if (!shouldSkipReplacement) {
+    content = content.replace(/<meta\s*name\s*=\s*["'][^"']*csrf-param["'][^>]*>/i, '');
+    content = content.replace(/<meta\s*name\s*=\s*["'][^"']*csrf-token["'][^>]*>/i, '');}  
+  content = await removeUnwantedElements(content);
+  content = await replaceHtmlLinks(content);
+  content = await replaceSensitiveWords(content, sensitiveWords);
+  const res = [
+{raw: /href="\/zh-CN\//g, re: 'href="/zh-hans/'},
+{raw: /href="\/zh-TW\//g, re: 'href="/zh-hant/'},
+{raw: /action="\/zh-CN\//g, re: 'action="/zh-hans/'},
+{raw: /action="\/zh-TW\//g, re: 'action="/zh-hant/'},
+{raw: /src="\/zh-CN\//g, re: 'src="/zh-hans/'},
+{raw: /src="\/zh-TW\//g, re: 'src="/zh-hant/'},
+{raw: /greasyfork\.org\//g, re: `你的部署链接/`},
+// {raw: /<a\s+[^>]*href="\/zh-hans\/users\/sign_up"[^>]*>[\s\S]*?<\/a>/gi, re: `<h1>Greasy Fork 帳戶登入功能僅在部分頁面有效（使用者、討論、舉報），其它頁面無登入狀態支援</h1><br>如您需要完整帳戶服務（如註冊帳號和發起討論）<a href="https://datong.info/translate?target=https://greasyfork.org/zh-CN" target="_blank">可點此進入大同翻譯網頁代理器</a>，或者您可以自行訪問Greasy Fork 原站。`},
+{raw: /<\/head>/i, re: `<script src="https://cdn.jsdmirror.cn/gh/dahisea/Re-GFork-web@main/js/main.js" crossorigin="anonymous" type="module"></script></head>`},
+{raw: /<\/body>/i, re: `<footer style="font-size:11px;text-align:center"><br><section class="text-content"><br><form class="language-selector" action="/" method="GET"><select class="language-selector-locale" id="locale-select" name="locale" aria-label="選擇網站語言"><option value="" disabled selected>選擇語言</option><option data-language-url="/zh-hans" value="zh-CN">简体字</option><option data-language-url="/zh-hant" value="zh-TW">正體字</option><option data-language-url="/ja" value="ja">日本語</option><option data-language-url="/en" value="en">ＥＮＧ</option></select></form><br><a href="/page/tos">用戶協議</a><br><img src="https://cdn.jsdmirror.cn/gh/dahisea/w_file@main/assets/img/15p.svg" alt="分級" style="width:65px;height:65px;cursor:pointer"><br><p>© 2020-2023 GFork.</p><p>序幕展開<span id="htmer_time"></span></p><div id="api-data" style="font-size:9px;text-align:left">少女祈禱中...</div><br></section></footer></body>`},
+{raw: /<li\b[^>]*\bclass\s*=\s*["'][^"']*ad-entry[^"']*["'][^>]*>[\s\S]*?<\/li>/gi, re: ``},
+{raw: /<a\s+class="install-link"[^>]*href="([^"]+)"[^>]*>/gi, re: `<details><summary>點此查看下載連結</summary><code>$1</code></details><br><a class="install-link" href="https://你的部署链接/redirect/#$1" target="_blank">`},
+{raw: /<div\s+[^>]*id\s*=\s*["']script-feedback-suggestion["'][^>]*>/gi, re: `<br><div id="script-feedback-suggestion">`},
+{raw: /<li[^>]*data-script-id="[^"]*"[^>]*data-code-url="([^"]+)"[^>]*>([\s\S]*?)<\/dl>/gi, re: `<li>$2<a href="$1" target="_blank">立即安装此脚本</a></dl>`},
+{raw: /<title>([\s\S]*?)<\/title>/i, re: `<title>GFork Mirrors 程式頁面 - 加速訪問與腳本下載 | $1</title>`},
+// {raw: /<meta\s+name="description"\s+value="([^"]*)"\s*\/?>/i, re: `<meta name="description" content="GFork專為使用者解決存取慢、腳本下載難的問題（Mirrored） - $1">`},
+// {raw: /<div\b[^>]*\bid\s*=\s*["'][^"']*site-name-text[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, re: `<div id="site-name-text"><a href="https://你的部署链接/zh-hans"><h1>GFork</h1></a></div>`},
+// {raw: /(<section id="script-info">)/i, re: `<p class="notice">你正在訪問的內容是外部程式的映像位址，僅用於使用者加速訪問，本站無法保證其可靠性，當前連結為 <a>https://你的部署链接${path}</a>，源站連結 <a href="https://www.coolapk.com/link/?url=https://greasyfork.org${newPath}">點此</a>。</p>$1`},
+{raw: /<a\s+class="script-link"\s+href="([^"]*)">/gi, re: '<a class="script-link" href="$1" target="_blank">'},
+{raw: /<span\s+class="sign-in-link">\s*<a\s+rel="nofollow"\s+href="[^"]*">/gi, re: '<span class="sign-in-link"><a rel="nofollow" href="/zh-hans/users/sign_in?return_to=/zh-hans/users/1442595" target="_blank">'},
+{raw: /(\s*\r?\n\s*)+/g, re: ''}
+];
+res.forEach(({raw, re}) => {content = content.replace(raw, re);});return content;}
