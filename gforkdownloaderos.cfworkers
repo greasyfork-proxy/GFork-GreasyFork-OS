@@ -1,0 +1,48 @@
+addEventListener('fetch', e => e.respondWith(handleRequest(e.request)));
+
+async function handleRequest(r) {
+
+    if (r.method !== 'GET' && r.method !== 'HEAD') {
+        return new Response('Method Not Allowed', { status: 405 });
+    }
+
+    const t = new URL(r.url);
+    t.hostname = 'update.greasyfork.org';
+
+    const h = new Headers();
+    h.set('User-Agent', r.headers.get('User-Agent') || '');
+
+    const cacheKey = new Request(t.toString(), { headers: h });
+    let response = await caches.default.match(cacheKey);
+
+    if (!response) {
+        const f = await fetch(new Request(t, {
+            method: r.method,
+            headers: h,
+            redirect: 'follow'
+        }));
+
+        if (f.status >= 400) {
+            return Response.redirect('https://www4.bing.com/search?q=greasyfork-proxy.github.io', 302);
+        }
+
+        let x = await f.text();
+        x = x.replace(/@connect\s+greasyfork\.org/g, '@connect greasyfork.org.cn');
+        x = x.replace(/@connect\s+update\.greasyfork\.org/g, '@connect update.greasyfork.org.cn');
+        x = x.replace(/@connect\s+api\.greasyfork\.org/g, '@connect api.greasyfork.org.cn');
+        x = x.replace(/greasyfork\.org\//g, 'greasyfork.org.cn/');
+
+        response = new Response(x, {
+            status: f.status,
+            headers: new Headers(f.headers)
+        });
+
+        response.headers.set('Cache-Control', 'public, max-age=360000');
+        response.headers.set('CDN-Cache-Control', 'public, max-age=360000');
+
+        const cacheResponse = response.clone();
+        await caches.default.put(cacheKey, cacheResponse);
+    }
+
+    return response;
+}
